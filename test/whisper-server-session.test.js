@@ -57,7 +57,13 @@ test('loads one server process and reuses it for multiple in-memory inferences',
   await session.start();
   await session.start();
   assert.equal(spawnCalls.length, 1);
-  const argumentsList = spawnCalls[0][1];
+  // On POSIX the server runs under a watchdog shell (kills it if cue dies), so
+  // the real whisper-server arguments come after the executable path in argv;
+  // on Windows they are the argv directly. Locate them either way.
+  const rawArgs = spawnCalls[0][1];
+  const modelIdx = rawArgs.indexOf('--model');
+  assert.ok(modelIdx >= 0, 'whisper-server args present in spawn argv');
+  const argumentsList = rawArgs.slice(modelIdx);
   assert.deepEqual(argumentsList.slice(0, 2), ['--model', modelPath]);
   assert.ok(argumentsList.includes('--request-path'));
   assert.ok(!argumentsList.includes('--convert'));

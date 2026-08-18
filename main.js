@@ -48,6 +48,7 @@ const { WhisperModelManager } = require('./src/whisper-model-manager');
 const { requireWhisperModel } = require('./src/whisper-model-catalog');
 const { locateWhisperRuntime } = require('./src/whisper-runtime');
 const { LocalWhisperTranscriber } = require('./src/local-whisper-transcriber');
+const { reapOrphanedServers } = require('./src/whisper-server-session');
 
 let win = null;
 // Which global shortcuts cue actually holds. `globalShortcut.register` returns
@@ -992,6 +993,10 @@ function launchApp() {
 
   whisperModelManager = new WhisperModelManager({ userDataPath: app.getPath('userData') });
   history.init(app.getPath('userData')); // ~/.config/cue/history/<date>/ — created on first message only
+  // Reap whisper-servers leaked by a previous cue that died uncleanly — a leaked
+  // one holds ~1.8GB VRAM and makes every later model load SIGABRT.
+  const reaped = reapOrphanedServers();
+  if (reaped) console.log(`[cue] reaped ${reaped} orphaned whisper-server process(es)`);
   // Warm the local model onto the GPU in the background so the first listen is instant.
   setTimeout(preloadLocalWhisper, 1500);
 

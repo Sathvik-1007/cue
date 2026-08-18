@@ -6,6 +6,57 @@ const { spawn } = require('child_process');
 const { pcmToWav } = require('./wav');
 
 const LOOPBACK_HOST = '127.0.0.1';
+
+// Turn a whisper-server death into a sentence a person can act on, instead of
+// dumping a gdb backtrace into the UI. The abort-during-model-load pattern is
+// almost always the GPU/host running out of memory for the model.
+function describeServerExit(code, signal, logTail) {
+  const tail = String(logTail || '');
+  const abortedOnLoad = (signal === 'SIGABRT' || code === 134) && /whisper_model_load|ggml_backend_buffer|whisper_init/.test(tail);
+  if (abortedOnLoad) {
+    return 'The speech model could not be loaded — most likely the GPU (or system) ran out of memory. ' +
+      'Close other GPU-heavy apps or pick a smaller model (small.en / base.en) and try again.';
+  }
+  if (signal === 'SIGKILL') return 'The speech engine was killed (out of memory?). Try a smaller model.';
+  const brief = tail.split('\n').filter((l) => /error|fail|abort|cannot|unable/i.test(l)).slice(-2).join(' ').slice(0, 220);
+  return `The speech engine exited (${code ?? signal}).${brief ? ' ' + brief : ''}`;
+}
+
+// ---- orphan protection ----------------------------------------------------
+// Every whisper-server we spawn is recorded in a PID file; on the next start we
+// reap any that are still alive from a previous cue that died uncleanly, so a
+// leaked server can never hold the GPU hostage.
+const os = require('os');
+const PID_FILE = path.join(os.tmpdir(), 'cue-whisper-servers.pids');
+function readPids() {
+  try { return fs.readFileSync(PID_FILE, 'utf8').split('\n').map((l) => parseInt(l, 10)).filter((n) => n > 0); }
+  catch (_) { return []; }
+}
+function writePids(pids) {
+  try { fs.writeFileSync(PID_FILE, pids.join('\n') + (pids.length ? '\n' : '')); } catch (_) { /* best effort */ }
+}
+function registerServerPid(pid) {
+  if (!pid) return;
+  writePids([...new Set([...readPids(), pid])]);
+}
+function unregisterServerPid(pid) {
+  writePids(readPids().filter((p) => p !== pid));
+}
+// Kill leftover whisper-servers from a previous run (ours only, by PID +
+// command line) and return how many were reaped.
+function reapOrphanedServers() {
+  let reaped = 0;
+  const alive = [];
+  for (const pid of readPids()) {
+    let cmd = '';
+    try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch (_) { continue; } // gone
+    if (/whisper-server|cue-whisper-watch/.test(cmd)) {
+      try { process.kill(pid, 'SIGTERM'); reaped++; } catch (_) { /* already gone */ }
+    } else { alive.push(pid); }
+  }
+  writePids([]);
+  return reaped;
+}
 const STARTUP_TIMEOUT_MS = 180000;
 const HEALTH_POLL_MS = 150;
 const INFERENCE_TIMEOUT_MS = 120000;
@@ -106,13 +157,23 @@ class WhisperServerSession {
     const argumentsList = this._buildArguments(port, requestPath);
 
     this.onState({ status: 'loading', message: 'Loading the local Whisper model…' });
-    this.child = this.spawnImpl(this.executablePath, argumentsList, {
+    // On Linux/macOS, run whisper-server under a tiny watchdog shell: it kills
+    // the server the moment cue's process disappears — including SIGKILL / a
+    // crash, where our own will-quit cleanup never runs. Without this an
+    // orphaned server kept ~1.8GB of VRAM and every later model load SIGABRTed.
+    const usePdeathWatch = process.platform !== 'win32';
+    const spawnCmd = usePdeathWatch ? '/bin/sh' : this.executablePath;
+    const spawnArgs = usePdeathWatch
+      ? ['-c', 'PARENT=$1; shift; "$@" & CHILD=$!; while kill -0 "$PARENT" 2>/dev/null && kill -0 "$CHILD" 2>/dev/null; do sleep 1; done; kill "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null', 'cue-whisper-watch', String(process.pid), this.executablePath, ...argumentsList]
+      : argumentsList;
+    this.child = this.spawnImpl(spawnCmd, spawnArgs, {
       cwd: this.runtimeDirectory,
       env: this._buildRuntimeEnvironment(),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true
     });
     this._observeChild(this.child);
+    registerServerPid(this.child.pid);
 
     try {
       await this._waitUntilHealthy();
@@ -226,6 +287,7 @@ class WhisperServerSession {
   }
 
   _observeChild(child) {
+    child.on('exit', () => unregisterServerPid(child.pid));
     const collectLog = (data) => {
       this.logTail = (this.logTail + data.toString()).slice(-MAX_LOG_TAIL_CHARACTERS);
     };
@@ -234,7 +296,7 @@ class WhisperServerSession {
     child.once('error', (error) => { this.exitError = error; });
     child.once('exit', (code, signal) => {
       if (this.child === child) {
-        this.exitError = new Error(`whisper-server exited (${code ?? signal}). ${this.logTail.slice(-800)}`);
+        this.exitError = new Error(describeServerExit(code, signal, this.logTail));
       }
     });
   }
@@ -264,5 +326,6 @@ module.exports = {
   WhisperServerSession,
   LOOPBACK_HOST,
   findFreeLoopbackPort,
-  buildMultipartBody
+  buildMultipartBody,
+  reapOrphanedServers
 };
