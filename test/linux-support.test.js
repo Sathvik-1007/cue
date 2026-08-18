@@ -110,3 +110,17 @@ test('gpu-select prefers a discrete GPU over the integrated one', () => {
   // only integrated + software -> null (don't force anything)
   assert.equal(g.pickDeviceIndex(['Intel(R) Iris Xe', 'llvmpipe']), null);
 });
+
+test('local transcriber drops speaker bleed on "you" but keeps a real voice', () => {
+  const { LocalWhisperTranscriber } = require('../src/local-whisper-transcriber');
+  const t = new LocalWhisperTranscriber({ sessionOptions: {}, sessionFactory: () => ({}), segmenterFactory: () => ({}) });
+  const mk = (amp) => { const b = Buffer.alloc(16000 * 2); const v = new Int16Array(b.buffer); for (let i = 0; i < v.length; i++) v[i] = Math.round(Math.sin(i / 3) * amp); return b; };
+  const loud = mk(9000), quiet = mk(2500);
+  const rms = (buf) => { const v = new Int16Array(buf.buffer, buf.byteOffset, buf.length / 2); let a = 0; for (let i = 0; i < v.length; i += 8) a += v[i] * v[i]; return Math.sqrt(a / (v.length / 8)); };
+  t._lastThemRms = rms(loud); t._trackSpeech('them', true);
+  assert.equal(t._isSpeakerBleed('you', quiet), true, 'quiet mic while speaker loud = echo, dropped');
+  assert.equal(t._isSpeakerBleed('you', loud), false, 'loud mic while speaker loud = real voice, kept');
+  t._trackSpeech('them', false); t._speech.themLastEnd = 0;
+  assert.equal(t._isSpeakerBleed('you', quiet), false, 'speaker silent = everything kept');
+  assert.equal(t._isSpeakerBleed('them', quiet), false, 'guard never touches the them channel');
+});

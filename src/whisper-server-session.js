@@ -87,6 +87,8 @@ class WhisperServerSession {
     this.inferenceControllers = new Set();
   }
 
+  isRunning() { return !!this.child && !this.exitError; }
+
   async start() {
     if (this.child) return;
     this.stopRequested = false;

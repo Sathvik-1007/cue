@@ -37,6 +37,12 @@ class LocalWhisperTranscriber {
   async start() {
     this.discardPendingJobs = false;
     await this.session.start();
+    this._buildSegmenters();
+    this.acceptingAudio = true;
+  }
+
+  _buildSegmenters() {
+    this.segmenters.clear();
     for (const channel of CHANNELS) {
       const isRemoteAudio = channel === 'them';
       this.segmenters.set(channel, this.segmenterFactory({
@@ -47,22 +53,62 @@ class LocalWhisperTranscriber {
           silenceFrames: isRemoteAudio ? 20 : 18
         },
         onSpeechState: (speechChannel, speaking, durationMs) => {
+          this._trackSpeech(speechChannel, speaking);
           this.onSpeechState(speechChannel, speaking, durationMs);
         },
-        onUtterance: (utteranceChannel, pcm) => this._enqueue(utteranceChannel, pcm)
+        onUtterance: (utteranceChannel, pcm) => {
+          if (this._isSpeakerBleed(utteranceChannel, pcm)) return; // drop echo of "them"
+          this._enqueue(utteranceChannel, pcm);
+        }
       }));
     }
-    this.acceptingAudio = true;
+  }
+
+  // ---- speaker-bleed guard --------------------------------------------------
+  // The laptop mic hears the speakers, so "them" audio leaks into "you" and gets
+  // transcribed twice (once correctly as them, once garbled as you). We can't
+  // use echo cancellation (it makes the audio server touch other streams). So:
+  // a "you" utterance that was captured while "them" was speaking AND is much
+  // quieter than what "them" is producing is treated as bleed and dropped. A
+  // real person talking over the speaker is louder at the mic and gets through.
+  _trackSpeech(channel, speaking) {
+    if (!this._speech) this._speech = { them: false, themLastEnd: 0 };
+    if (channel === 'them') {
+      this._speech.them = speaking;
+      if (!speaking) this._speech.themLastEnd = Date.now();
+    }
+  }
+  _isSpeakerBleed(channel, pcm) {
+    if (channel !== 'you' || !this._speech) return false;
+    const themActive = this._speech.them || (Date.now() - this._speech.themLastEnd) < 800;
+    if (!themActive) return false;
+    // RMS of this utterance vs the recent "them" level
+    const rms = (buf) => { const v = new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 2)); let a = 0; for (let i = 0; i < v.length; i += 8) a += v[i] * v[i]; return Math.sqrt(a / Math.max(1, v.length / 8)); };
+    const youRms = rms(pcm);
+    const themRms = this._lastThemRms || 0;
+    // bleed sits well below the source; a real voice at the mic is comparable or louder
+    return themRms > 0 && youRms < themRms * 0.55;
   }
 
   push(channel, pcm) {
     if (!this.acceptingAudio) return;
+    if (channel === 'them' && pcm && pcm.length >= 640) {
+      // running loudness of the speaker output, for the bleed guard
+      const v = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.length / 2));
+      let a = 0; for (let i = 0; i < v.length; i += 8) a += v[i] * v[i];
+      const r = Math.sqrt(a / Math.max(1, v.length / 8));
+      this._lastThemRms = this._lastThemRms ? this._lastThemRms * 0.7 + r * 0.3 : r;
+    }
     const segmenter = this.segmenters.get(channel);
     if (!segmenter) throw new Error(`Unknown local Whisper channel: ${channel}`);
     segmenter.push(pcm);
   }
 
-  async stop() {
+  // stop({ keepSession }) — with keepSession the whisper-server (and the model
+  // loaded on the GPU) stays resident so the NEXT listen starts instantly
+  // instead of paying the ~9s model load + ~7s shader warmup again. The
+  // caller releases the session on model change or app quit.
+  async stop({ keepSession = false } = {}) {
     this.acceptingAudio = false;
     for (const segmenter of this.segmenters.values()) segmenter.stop();
 
@@ -71,9 +117,27 @@ class LocalWhisperTranscriber {
       this.discardPendingJobs = true;
       this.session.abortInferences();
     }
-    await this.session.stop({ force: !drained });
+    if (!keepSession) await this.session.stop({ force: !drained });
     this.segmenters.clear();
-    this.onStatus({ status: 'off', message: 'Local Whisper stopped.' });
+    this.onStatus({ status: keepSession ? 'idle' : 'off', message: keepSession ? 'Local Whisper idle (model kept loaded).' : 'Local Whisper stopped.' });
+  }
+
+  // Re-arm segmenters on an already-running session (instant restart).
+  async resume() {
+    if (!this.session.isRunning || !this.session.isRunning()) return this.start();
+    this.discardPendingJobs = false;
+    this._buildSegmenters();
+    this.acceptingAudio = true;
+    this.onStatus({ status: 'ready', message: 'Local Whisper is ready.' });
+  }
+
+  // Warm the GPU shader pipeline once with a short silent clip so the first
+  // real chunk isn't slow (Vulkan compiles shaders lazily on first inference).
+  async warmup() {
+    try {
+      const silent = Buffer.alloc(16000 * 2); // 1s of 16k mono silence
+      await this.session.transcribe(silent);
+    } catch (_) { /* best effort */ }
   }
 
   forceStop() {

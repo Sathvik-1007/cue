@@ -91,6 +91,17 @@ let flushTimer = null;
 let whisperModelManager = null;
 let localWhisperTranscriber = null;
 let activeWhisperModelId = null;
+// Resident local-whisper session: kept alive (model on GPU, shaders warm)
+// between listen sessions so a re-start is instant. Keyed by model+runtime so
+// a model change replaces it. Released on quit.
+let residentWhisper = null; // { key, transcriber }
+function residentKey(model, runtime, localSettings) {
+  return [model.id, runtime.executablePath, localSettings.language || 'auto', Number(localSettings.threads) || 0].join('|');
+}
+async function releaseResidentWhisper() {
+  const r = residentWhisper; residentWhisper = null;
+  if (r) { try { await r.transcriber.forceStop(); } catch (_) {} }
+}
 let desiredCaptureState = false;
 let captureTransition = Promise.resolve(false);
 
@@ -161,6 +172,14 @@ async function startLocalWhisper(settings) {
     send('status', { message: `${model.id} is running on CPU, which is far too slow for live transcription (it falls minutes behind). Build the GPU runtime (Settings -> Audio hint) or pick base.en / small.en for CPU.` });
   }
   activeWhisperModelId = model.id;
+  const key = residentKey(model, runtime, localSettings);
+  // Instant path: the same model is already loaded and warm from last time.
+  if (residentWhisper && residentWhisper.key === key) {
+    localWhisperTranscriber = residentWhisper.transcriber;
+    await localWhisperTranscriber.resume();
+    return;
+  }
+  await releaseResidentWhisper(); // different model/runtime: drop the old one
   let transcriber = null;
   try {
     const modelPath = await whisperModelManager.verifyInstalledModel(model.id).catch((error) => {
@@ -194,12 +213,56 @@ async function startLocalWhisper(settings) {
 
     localWhisperTranscriber = transcriber;
     await transcriber.start();
+    residentWhisper = { key, transcriber };
+    // Warm the GPU shader pipeline now (first-inference compile) so the very
+    // first real chunk is fast, not 7s late.
+    transcriber.warmup().catch(() => {});
   } catch (error) {
     if (localWhisperTranscriber === transcriber) localWhisperTranscriber = null;
     activeWhisperModelId = null;
     if (transcriber) await transcriber.forceStop().catch(() => {});
     throw error;
   }
+}
+
+// Preload: when Local STT is configured, load + warm the model in the
+// background right after launch (and when the model setting changes), so the
+// first click on the mic is instant instead of a 9s+7s cold start.
+let preloadPromise = null;
+function preloadLocalWhisper() {
+  const settings = store.getSettings();
+  if ((settings.sttProvider || 'auto') !== 'local') return;
+  if (state.capturing || preloadPromise) return;
+  preloadPromise = (async () => {
+    try {
+      const localSettings = settings.localWhisper || {};
+      const model = requireWhisperModel(localSettings.modelId || 'base.en');
+      const runtime = getWhisperRuntime();
+      if (!runtime.available) return;
+      const key = residentKey(model, runtime, localSettings);
+      if (residentWhisper && residentWhisper.key === key) return; // already resident
+      await releaseResidentWhisper();
+      const modelPath = await whisperModelManager.verifyInstalledModel(model.id);
+      const transcriber = new LocalWhisperTranscriber({
+        sessionOptions: {
+          executablePath: runtime.executablePath, runtimeDirectory: runtime.runtimeDirectory, modelPath,
+          language: model.englishOnly ? 'en' : (localSettings.language || 'auto'),
+          threads: Number(localSettings.threads) || 0, tinydiarize: model.tinydiarize
+        },
+        onTranscript: publishTranscript,
+        onSpeechState: (channel, speaking, durationMs) => send('vad:state', { channel, speaking, durationMs }),
+        onStatus: (status) => send('stt:status', { provider: 'local', ...status }),
+        onError: (error) => { console.log('[local-whisper] error', error && error.message); }
+      });
+      await transcriber.start();
+      await transcriber.stop({ keepSession: true }); // idle: server up, not accepting audio
+      residentWhisper = { key, transcriber };
+      transcriber.warmup().catch(() => {});
+      console.log('[cue] local whisper preloaded: ' + model.id + ' (' + (runtime.backend || 'cpu') + ')');
+    } catch (error) {
+      console.log('[cue] local whisper preload skipped: ' + (error && error.message));
+    } finally { preloadPromise = null; }
+  })();
 }
 
 async function getWhisperOverview() {
@@ -558,7 +621,8 @@ async function setCapturing(active) {
   if (stoppingLocalTranscriber) {
     send('stt:status', { provider: 'local', status: 'stopping' });
     try {
-      await stoppingLocalTranscriber.stop();
+      // keepSession: model stays loaded on the GPU for an instant next start
+      await stoppingLocalTranscriber.stop({ keepSession: true });
     } catch (error) {
       console.log('[local-whisper] stop error', error && error.message);
     } finally {
@@ -668,7 +732,14 @@ async function runFeature(mode, userText, providedImages) {
 
 // -------- IPC --------
 ipcMain.handle('settings:get', () => store.getSettings());
-ipcMain.handle('settings:set', (_e, patch) => { sttDisabled = false; return store.setSettings(patch); });
+ipcMain.handle('settings:set', (_e, patch) => {
+  sttDisabled = false;
+  const next = store.setSettings(patch);
+  // A change to the STT provider or local model: (re)preload so the mic is
+  // instant next time. Cheap when nothing relevant changed (keyed check).
+  if (patch && (patch.sttProvider !== undefined || patch.localWhisper !== undefined)) setTimeout(preloadLocalWhisper, 200);
+  return next;
+});
 ipcMain.handle('capture:toggle', () => {
   const targetState = !desiredCaptureState;
   desiredCaptureState = targetState;
@@ -921,6 +992,8 @@ function launchApp() {
 
   whisperModelManager = new WhisperModelManager({ userDataPath: app.getPath('userData') });
   history.init(app.getPath('userData')); // ~/.config/cue/history/<date>/ — created on first message only
+  // Warm the local model onto the GPU in the background so the first listen is instant.
+  setTimeout(preloadLocalWhisper, 1500);
 
   const allowMedia = (permission) => permission === 'media' || permission === 'microphone' || permission === 'audioCapture' || permission === 'display-capture' || permission === 'screen';
   session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => cb(allowMedia(permission)));
@@ -991,6 +1064,7 @@ app.on('will-quit', () => {
     whisperModelManager.cancelDownload(whisperModelManager.activeDownload.modelId);
   }
   if (localWhisperTranscriber) localWhisperTranscriber.forceStop().catch(() => {});
+  releaseResidentWhisper().catch(() => {});
 });
 app.on('window-all-closed', () => app.quit());
 
