@@ -47,6 +47,15 @@ class LocalWhisperTranscriber {
       const isRemoteAudio = channel === 'them';
       this.segmenters.set(channel, this.segmenterFactory({
         channel,
+        // Close at a real pause, or once 4s long at the first brief pause; the
+        // hard cap cuts at the quietest recent frame; sub-200ms bursts are
+        // dropped (whisper hallucinates on clicks/breaths). See UtteranceSegmenter.
+        maxUtteranceMs: 12000,
+        overlapMs: 0,
+        softCutMs: 4000,
+        softPauseMs: 200,
+        cutSearchMs: 1500,
+        minSpeechMs: 200,
         vadOptions: {
           onsetThreshold: isRemoteAudio ? 200 : 220,
           offsetThreshold: isRemoteAudio ? 120 : 130,

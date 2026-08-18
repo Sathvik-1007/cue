@@ -238,11 +238,6 @@ button:focus { outline: none; }
   -webkit-user-select: text; user-select: text;
 }
 .interim-transcript.show { display: block; animation: fadeUp 150ms ease both; }
-/* "hearing you…" — a gentle green pulse so it's obvious cue is actively
-   listening to speech right now (before any words come back). */
-.interim-transcript.hearing { color: rgba(134,239,172,0.95); animation: hearingPulse 1.1s ease-in-out infinite; }
-@keyframes hearingPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
-.ts-interim-row .ts-text { animation: hearingPulse 1.1s ease-in-out infinite; }
 
 /* VAD speaking indicator on live dot */
 #live-dot.speaking {
@@ -737,7 +732,9 @@ button:focus { outline: none; }
   margin-right: 6px;
 }
 .ts-text { display: inline; }
-.ts-interim { font-style: italic; opacity: 0.5; }
+.ts-interim { font-style: italic; opacity: 0.7; }
+/* Interim: words two passes agreed on are solid; the still-revisable tail is dimmed. */
+.interim-transcript .tentative, .ts-interim .tentative { opacity: 0.45; }
 
 .ts-footer {
   margin-top: 10px;

@@ -3,7 +3,7 @@ const path = require('path');
 const os = require('os');
 const store = require('./src/store');
 const { captureScreenshot } = require('./src/screen');
-const { createSTT } = require('./src/stt');
+const { createSTT, looksLikeHallucination, collapseRepeats } = require('./src/stt');
 const { parseDocumentFile } = require('./src/resume');
 const { createLLM } = require('./src/llm');
 const { MODES } = require('./src/prompts');
@@ -155,8 +155,9 @@ function getWhisperRuntime() {
 }
 
 function publishTranscript(channel, text) {
-  if (!text || !text.trim()) return;
-  const turn = { channel, text: text.trim(), ts: Date.now() };
+  text = collapseRepeats(text);
+  if (!text || looksLikeHallucination(text)) return; // every provider, incl. local whisper
+  const turn = { channel, text, ts: Date.now() };
   pushTranscript(turn);
   send('transcript', turn);
   send('stt:final', { channel, text: turn.text });
@@ -495,17 +496,34 @@ function startCloudSegmenters() {
       // stream aggressively: hard-cap at 4s of continuous speech, end an
       // utterance after a shorter pause, and keep a longer pre-roll so the
       // first word after silence ("And so...") is never clipped.
-      maxUtteranceMs: 3000,
-      preRollMs: 500,
-      vadOptions: { onsetThreshold: remote ? 200 : 220, offsetThreshold: remote ? 120 : 130, silenceFrames: remote ? 12 : 12 },
+      // Streaming over a batch endpoint: while someone talks, the growing
+      // utterance is re-sent every ~800ms and shown as interim words (whisper's
+      // cost is ~flat per request, so a 1s and a 10s window cost about the
+      // same); the final pass runs when the utterance closes.
+      // Utterances close at a real pause (600ms), or - once 4s long - at the
+      // first brief pause (200ms) so latency stays bounded without ever cutting
+      // a word; the 12s hard cap cuts at the quietest recent frame. Bursts
+      // with <200ms of speech energy (clicks, breaths) are never sent.
+      maxUtteranceMs: 12000,
+      preRollMs: 400,
+      overlapMs: 0,
+      softCutMs: 4000,
+      softPauseMs: 200,
+      cutSearchMs: 1500,
+      minSpeechMs: 200,
+      partialIntervalMs: 800,
+      vadOptions: { onsetThreshold: remote ? 200 : 220, offsetThreshold: remote ? 120 : 130, silenceFrames: 20 },
       onSpeechState: (ch, speaking, durationMs) => {
         if (ch === 'them') { cloudBleed.them = speaking; if (!speaking) cloudBleed.themLastEnd = Date.now(); }
         send('vad:state', { channel: ch, speaking, durationMs });
-        // Live feedback: the instant speech is detected show a "hearing you"
-        // interim, so there is never a silent gap between speaking and text.
-        if (speaking) send('stt:interim', { channel: ch, text: '…', phase: 'hearing' });
       },
-      onUtterance: (ch, pcm) => sendCloudUtterance(ch, pcm)
+      onPartial: (ch, pcm) => sendCloudPartial(ch, pcm),
+      onUtterance: (ch, pcm) => {
+        const st = cloudPartial[ch];
+        st.gen++; st.pending = null; st.lastWords = [];
+        if (st.controller) st.controller.abort(); // a partial in flight is stale now: free the endpoint for the final
+        sendCloudUtterance(ch, pcm);
+      }
     });
   }
 }
@@ -523,6 +541,45 @@ function isCloudSpeakerBleed(channel, pcm) {
   const themActive = cloudBleed.them || (Date.now() - cloudBleed.themLastEnd) < 800;
   return themActive && cloudBleed.themRms > 0 && rms16(pcm) < cloudBleed.themRms * 0.55;
 }
+// Interim words for an utterance still in progress: one request in flight per
+// channel; if more audio arrives meanwhile the newest window is sent as soon
+// as the current one returns. `gen` bumps when the utterance is finalized so a
+// late partial can't overwrite the final.
+const cloudPartial = {
+  you: { busy: false, pending: null, gen: 0, lastWords: [], context: '', controller: null },
+  them: { busy: false, pending: null, gen: 0, lastWords: [], context: '', controller: null }
+};
+const normWord = (w) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, '');
+async function sendCloudPartial(channel, pcm) {
+  const st = cloudPartial[channel];
+  if (!state.capturing || pcm.length < 24000) return; // <750ms: nothing to say yet
+  if (isCloudSpeakerBleed(channel, pcm)) return;
+  if (st.busy) { st.pending = pcm; return; }
+  st.busy = true;
+  const gen = st.gen;
+  st.controller = new AbortController();
+  try {
+    const stt = createSTT(store.getSettings());
+    if (!stt.available) return;
+    const res = await stt.transcribe(pcm, { context: st.context, signal: st.controller.signal });
+    const text = collapseRepeats(res.text);
+    if (gen === st.gen && text && !looksLikeHallucination(text) && state.capturing) {
+      // LocalAgreement: words that two consecutive partials agree on are shown
+      // as stable; the tail (which whisper may still revise) as tentative.
+      const words = text.split(/\s+/);
+      let n = 0;
+      while (n < words.length && n < st.lastWords.length && normWord(words[n]) === normWord(st.lastWords[n])) n++;
+      st.lastWords = words;
+      send('stt:interim', { channel, text, stable: words.slice(0, n).join(' ') });
+    }
+  } catch (_) {
+  } finally {
+    st.busy = false;
+    st.controller = null;
+    if (st.pending && gen === st.gen) { const next = st.pending; st.pending = null; sendCloudPartial(channel, next); }
+    else st.pending = null;
+  }
+}
 async function sendCloudUtterance(channel, pcm) {
   if (!state.capturing) return;
   if (rms16(pcm) < RMS_GATE) return; // silence gate
@@ -531,7 +588,6 @@ async function sendCloudUtterance(channel, pcm) {
   state.transcribing[channel] = true;
   const t0 = Date.now();
   const durMs = Math.round(pcm.length / 32); // 16kHz s16 mono
-  send('stt:interim', { channel, text: '…', phase: 'transcribing' });
   try {
     const settings = store.getSettings();
     const stt = createSTT(settings);
@@ -539,12 +595,14 @@ async function sendCloudUtterance(channel, pcm) {
       if (!sttDisabled) { sttDisabled = true; send('status', { message: 'No transcription provider configured. Pick one in Settings → Audio (Local, Custom, Deepgram, OpenAI, Gemini, or Azure).' }); }
       return;
     }
-    const res = await stt.transcribe(pcm);
+    const res = await stt.transcribe(pcm, { context: cloudPartial[channel].context });
     if (res.error) { send('stt:final', { channel, text: '' }); handleSttError(res.error, settings); return; }
     const text = (res.text || '').trim();
     console.log(`[stt] ${channel} ${durMs}ms audio -> ${Date.now() - t0}ms latency${text ? '' : ' (empty)'}`);
-    if (text && text.length > 1 && !/^[?!.,;:\-…]+$/.test(text)) publishTranscript(channel, text);
-    else send('stt:final', { channel, text: '' }); // nothing said: clear "transcribing…"
+    if (text && text.length > 1 && !/^[?!.,;:\-…]+$/.test(text)) {
+      cloudPartial[channel].context = (cloudPartial[channel].context + ' ' + text).slice(-300);
+      publishTranscript(channel, text);
+    } else send('stt:final', { channel, text: '' }); // nothing said: clear the interim
   } catch (e) {
     send('stt:final', { channel, text: '' });
     console.log('[stt] error', e && e.message);

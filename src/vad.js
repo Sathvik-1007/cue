@@ -35,6 +35,14 @@ class AdaptiveVAD {
     this.onSpeechStart = options.onSpeechStart || (() => {});
     this.onSpeechEnd = options.onSpeechEnd || (() => {});
     this.onVADState = options.onVADState || (() => {});
+    // Per-frame hook (energy + classification) so a segmenter can find pauses
+    // and low-energy cut points at 30ms resolution.
+    this.onFrame = options.onFrame || (() => {});
+    // Fired when a burst too short to be speech (< minSpeechFrames) ends
+    // WITHOUT onSpeechEnd — a click or a breath. Listeners that started
+    // collecting on onSpeechStart must discard, or they'd sit collecting
+    // silence until their cap and then transcribe it (= hallucinations).
+    this.onSpeechAbort = options.onSpeechAbort || (() => {});
   }
 
   // Process a chunk of Int16 PCM audio
@@ -74,6 +82,7 @@ class AdaptiveVAD {
 
     const isSpeech = energy > dynamicOnset;
     const isSilence = energy < dynamicOffset;
+    this.onFrame(energy, isSpeech, isSilence);
 
     switch (this.state) {
       case 'silence':
@@ -108,6 +117,8 @@ class AdaptiveVAD {
             const wasSpeech = this.speechFrameCount >= this.minSpeechFrames;
             if (wasSpeech) {
               this.onSpeechEnd(this.speechFrameCount * this.frameDurationMs);
+            } else {
+              this.onSpeechAbort();
             }
             this.state = 'silence';
             this.speechFrameCount = 0;

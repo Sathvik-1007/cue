@@ -49,3 +49,24 @@ test('Deepgram drops hallucinated finals', () => {
   d._handleMessage({ type: 'Results', is_final: true, speech_final: true, channel: { alternatives: [{ transcript: 'Thank you.' }] } });
   assert.deepEqual(finals, []);
 });
+
+const { collapseRepeats, keepSegments } = require('../src/stt');
+test('collapseRepeats folds whisper decoder loops, keeps real speech', () => {
+  assert.equal(collapseRepeats('I think, I think, I think we should go.'), 'I think, we should go.');
+  assert.equal(collapseRepeats('ask not what you can do, ask what you can do, ask what you can do, ask what you can do.'), 'ask not what you can do, ask what you can do.');
+  assert.equal(collapseRepeats('Tell me about your experience with Kubernetes.'), 'Tell me about your experience with Kubernetes.');
+  assert.equal(collapseRepeats('no no'), 'no no');
+});
+test('keepSegments drops low-confidence / looping / past-the-end segments', () => {
+  const ok = { text: ' And so, my fellow Americans.', end: 10.4, avg_logprob: -0.2, compression_ratio: 1.3, no_speech_prob: 0 };
+  assert.equal(keepSegments({ duration: 11, segments: [ok] }), 'And so, my fellow Americans.');
+  assert.equal(keepSegments({ duration: 1, segments: [{ ...ok, text: ' Thank you.', end: 29.98 }] }), '');
+  assert.equal(keepSegments({ duration: 5, segments: [{ ...ok, avg_logprob: -1.4 }] }), '');
+  assert.equal(keepSegments({ duration: 5, segments: [{ ...ok, compression_ratio: 3.1 }] }), '');
+  assert.equal(keepSegments({ duration: 5, segments: [{ ...ok, no_speech_prob: 0.9 }] }), '');
+  assert.equal(keepSegments({ text: 'plain json fallback' }), 'plain json fallback');
+});
+test('looksLikeHallucination catches URLs, tags, loops', () => {
+  ['www.pens.com.au', '[BLANK_AUDIO]', '(music)', 'S3, EC2, EC2, EC2, EC2, EC2', 'Subtitles by the Amara.org community'].forEach((s) => assert.equal(looksLikeHallucination(s), true, s));
+  ['Yes.', 'I led the migration to EKS.', 'We use S3 and EC2 a lot.'].forEach((s) => assert.equal(looksLikeHallucination(s), false, s));
+});

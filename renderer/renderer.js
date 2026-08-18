@@ -385,7 +385,32 @@
   }
 
   // ---- Auto-fill the input box with transcribed speech from interviewer ----
+  // Live words land in the input box itself while the interviewer is still
+  // talking: the box shows <finals so far> + <current interim>; each final
+  // replaces its interim, so the text never jumps or duplicates.
+  let sttInterimBase = null; // input value before the interim overlay (null = no overlay)
+  function showInterimInBox(text) {
+    if (!inputFromSTT && input.value.trim().length > 0 && sttInterimBase === null) return; // user typed something
+    if (sttInterimBase === null) sttInterimBase = input.value.trim();
+    clearTimeout(softClearTimer);
+    composer.classList.remove('stt-dimmed');
+    input.value = sttInterimBase ? sttInterimBase + ' ' + text : text;
+    inputFromSTT = true;
+    lastSTTValue = input.value;
+    composer.classList.add('stt-filling');
+    syncPlaceholder();
+    updateSendButtonState();
+    input.scrollTop = input.scrollHeight;
+  }
+  function dropInterimFromBox() {
+    if (sttInterimBase === null) return;
+    input.value = sttInterimBase;
+    lastSTTValue = input.value;
+    sttInterimBase = null;
+    syncPlaceholder();
+  }
   function autoFillInputFromSTT(text) {
+    dropInterimFromBox(); // the final replaces its interim
     // If user has manually typed something different, don't overwrite
     if (!inputFromSTT && input.value.trim().length > 0) return;
 
@@ -457,6 +482,7 @@
         // User has been speaking for a while — they're answering, clear the box
         saveToQuestionHistory(input.value);
         input.value = '';
+        sttInterimBase = null;
         inputFromSTT = false;
         composer.classList.remove('stt-filling', 'stt-dimmed', 'stt-ready', 'stt-accumulating');
         syncPlaceholder();
@@ -472,6 +498,7 @@
     const hadContent = input.value.trim().length > 0;
     saveToQuestionHistory(input.value);
     input.value = '';
+    sttInterimBase = null;
     inputFromSTT = false;
     lastSTTValue = ''; // FIX #6: Clear the tracked STT value
     userSpeechStart = null;
@@ -525,6 +552,7 @@
         // User made a major change — detach from STT mode
         saveToQuestionHistory(lastSTTValue);
         inputFromSTT = false;
+        sttInterimBase = null;
         lastSTTValue = '';
         composer.classList.remove('stt-filling', 'stt-dimmed', 'stt-ready', 'stt-accumulating');
         clearTimeout(softClearTimer);
@@ -552,6 +580,7 @@
     saveToQuestionHistory(text);
     
     input.value = '';
+    sttInterimBase = null;
     inputFromSTT = false;
     lastSTTValue = ''; // FIX #6: Clear tracked STT value
     userSpeechStart = null;
@@ -1140,28 +1169,7 @@
     closeSidebarBtn.addEventListener('click', hideSidebar);
   }
 
-  // Type a chunk into a text node word by word (~35ms/word) so a transcript
-  // chunk visibly flows in like live speech instead of landing as one block.
-  // Chunks queue per element so successive chunks never interleave.
-  const typeQueues = new WeakMap();
-  function typeWords(el, chunk, sep) {
-    const words = String(chunk).trim().split(/\s+/).filter(Boolean);
-    if (!words.length) return;
-    const prev = typeQueues.get(el) || Promise.resolve();
-    const run = prev.then(() => new Promise((resolve) => {
-      let i = 0;
-      const tick = () => {
-        if (!el.isConnected) return resolve();
-        el.textContent += (el.textContent && i === 0 ? sep : (i === 0 ? '' : ' ')) + words[i];
-        i++;
-        if (i < words.length) setTimeout(tick, 35); else resolve();
-      };
-      tick();
-    }));
-    typeQueues.set(el, run);
-  }
-
-  function appendTranscriptHistoryTurn(channel, text, isInterim) {
+  function appendTranscriptHistoryTurn(channel, text, isInterim, stable) {
     const list = document.getElementById('ts-list');
     if (!list) return;
 
@@ -1183,18 +1191,22 @@
         tsSidebarInterimEl.appendChild(txt);
         list.appendChild(tsSidebarInterimEl);
       }
-      tsSidebarInterimEl.querySelector('.ts-text').textContent = text;
+      tsSidebarInterimEl.className = 'ts-turn ts-' + channel + ' ts-interim-row';
+      tsSidebarInterimEl.dataset.channel = channel;
+      tsSidebarInterimEl.querySelector('.ts-channel').textContent = channel === 'them' ? 'Them' : 'You';
+      renderInterim(tsSidebarInterimEl.querySelector('.ts-text'), '', text, stable);
+      list.appendChild(tsSidebarInterimEl); // keep the live row last
     } else {
-      // Remove interim row
-      if (tsSidebarInterimEl) { tsSidebarInterimEl.remove(); tsSidebarInterimEl = null; }
+      // Remove this channel's interim row (the other speaker's live row stays)
+      if (tsSidebarInterimEl && tsSidebarInterimEl.dataset.channel === channel) { tsSidebarInterimEl.remove(); tsSidebarInterimEl = null; }
 
       const existingRow = tsLastRow[channel];
       const useExisting = existingRow && existingRow.isConnected;
 
       if (useExisting) {
-        // Append to existing row — accumulates sentence fragments, typed in
+        // Append to existing row — accumulates sentence fragments
         const txt = existingRow.querySelector('.ts-text');
-        if (txt) typeWords(txt, text, ' ');
+        if (txt) txt.textContent += ' ' + text;
       } else {
         // Start a new row (no buttons — just clean history view)
         const row = document.createElement('div');
@@ -1209,9 +1221,9 @@
 
         row.appendChild(chLabel);
         row.appendChild(txt);
+        txt.textContent = text;
         list.appendChild(row);
         tsLastRow[channel] = row;
-        typeWords(txt, text, '');
       }
 
       // Reset silence timer
@@ -1310,46 +1322,39 @@
     }
   }
   
-  // Live-status phases from the utterance path (no partial words available
-  // from batch endpoints, so we show WHAT is happening instead of nothing):
-  //   hearing      -> speech detected, still listening
-  //   transcribing -> chunk sent, waiting for the words
-  function showPhase(channel, phase) {
-    const label = channel === 'them' ? 'Them' : 'You';
-    setLiveDotState(phase === 'hearing' ? 'speaking' : 'transcribing');
-    const el = getOrCreateInterimEl();
-    el.textContent = phase === 'hearing' ? `${label}: hearing you…` : `${label}: transcribing…`;
-    el.classList.add('show');
-    el.classList.toggle('hearing', phase === 'hearing');
-    appendTranscriptHistoryTurn(channel, phase === 'hearing' ? '● hearing…' : '● transcribing…', true);
+  // Partial words while the speaker is still talking. `stable` = the prefix
+  // two consecutive passes agreed on (shown solid); the rest is tentative
+  // (dimmed) and may still be revised by the next pass.
+  function renderInterim(el, prefix, text, stable) {
+    const stableText = stable && text.startsWith(stable) ? stable : '';
+    el.textContent = '';
+    if (prefix) el.appendChild(document.createTextNode(prefix));
+    if (stableText) el.appendChild(document.createTextNode(stableText));
+    const tail = text.slice(stableText.length);
+    if (tail) { const t = document.createElement('span'); t.className = 'tentative'; t.textContent = tail; el.appendChild(t); }
   }
-  function showHearing(channel) { showPhase(channel, 'hearing'); }
-  cue.on('stt:interim', ({ channel, text, phase }) => {
+  cue.on('stt:interim', ({ channel, text, stable }) => {
     const label = channel === 'them' ? 'Them' : 'You';
-    if (phase === 'hearing' || phase === 'transcribing') { showPhase(channel, phase); return; }
-    // Real partial words (WebSocket streaming providers)
     setLiveDotState('transcribing');
     const el = getOrCreateInterimEl();
-    el.textContent = `${label}: ${text}`;
+    renderInterim(el, `${label}: `, text, stable);
+    el.dataset.channel = channel;
     el.classList.add('show');
-    el.classList.remove('hearing');
-    appendTranscriptHistoryTurn(channel, text, true); // update sidebar interim
+    appendTranscriptHistoryTurn(channel, text, true, stable); // update sidebar interim
     
-    // FIX #12: Show interviewer's interim speech in input area
-    if (channel === 'them' && !input.value.trim()) {
-      showInterimInInput(text);
-    }
+    // Interviewer's live words go straight into the input box
+    if (channel === 'them') showInterimInBox(text);
   });
   cue.on('stt:final', ({ channel, text }) => {
     setLiveDotState('idle');
-    // Clear interim when we get a final
-    if (interimEl) { interimEl.textContent = ''; interimEl.classList.remove('show', 'hearing'); }
+    // Clear interim when we get a final (only this channel's — the other
+    // speaker's live words stay up)
+    if (interimEl && interimEl.dataset.channel === channel) { interimEl.textContent = ''; interimEl.classList.remove('show'); }
     clearTranscriptInterim();
     clearInputInterim(); // FIX #12: Clear interim text from input area
-    // sidebar: the final turn is added via the 'transcript' event below
-    // Still mid-sentence (chunk was capped, speech continues): keep showing
-    // "hearing you…" so the bar never goes blank while someone is talking.
-    if (vadSpeaking[channel]) showHearing(channel);
+    // sidebar + input box: the final turn is applied via the 'transcript' event
+    // (sent just before this); an empty final means nothing was said -> drop overlay
+    if (channel === 'them' && !text) dropInterimFromBox();
   });
   cue.on('stt:status', ({ channel, status, provider }) => {
     cue.log(`[stt] ${provider || channel || 'unknown'} ${status}`);
@@ -1381,13 +1386,8 @@
       if (label) { label.textContent = sttState; label.className = 'stt-status stt-streaming'; }
     }
   });
-  const vadSpeaking = { you: false, them: false };
   cue.on('vad:state', ({ channel, speaking }) => {
-    vadSpeaking[channel] = !!speaking;
     setLiveDotState(speaking ? 'speaking' : 'idle');
-    // Speech ended: drop the "hearing you…" bar (a chunk in flight will show
-    // "transcribing…" on its own).
-    if (!speaking && interimEl && interimEl.classList.contains('hearing')) { interimEl.textContent = ''; interimEl.classList.remove('show', 'hearing'); clearTranscriptInterim(); }
   });
   cue.on('llm:start', ({ userBubble, small, category }) => {
     responseCount++;
