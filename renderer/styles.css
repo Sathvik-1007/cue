@@ -110,9 +110,14 @@ html, body {
 .tb-hide:hover { background: rgba(255,255,255,0.08); }
 .tb-hide .chev { width: 14px; height: 14px; display: inline-flex; color: rgba(255,255,255,0.9); }
 .tb-hide.collapsed .chev { transform: rotate(180deg); }
-.tb-stop { width: 28px; height: 28px; border-radius: var(--r-8); color: #fff; }
+.tb-stop { width: 28px; height: 28px; border-radius: var(--r-8); color: #fff; transition: background 120ms ease, color 120ms ease; }
 .tb-stop:hover { background: rgba(255,255,255,0.08); }
-.tb-stop.active { color: #ff6b6b; }
+/* Listening: red stop glyph on a red tint, with a soft pulse so the state is
+   unmistakable at a glance. Pending (toggle in flight): slightly dimmed. */
+.tb-stop.active { color: #ff6b6b; background: rgba(255,80,80,0.16); animation: listenPulse 1.6s ease-in-out infinite; }
+.tb-stop.active:hover { background: rgba(255,80,80,0.26); }
+.tb-stop.pending { opacity: 0.6; animation: none; }
+@keyframes listenPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(255,80,80,0.35); } 50% { box-shadow: 0 0 0 5px rgba(255,80,80,0); } }
 .tb-quit { width: 28px; height: 28px; border-radius: var(--r-8); color: rgba(255,255,255,0.50); }
 .tb-quit:hover { background: rgba(255,68,68,0.18); color: #ff6b6b; }
 

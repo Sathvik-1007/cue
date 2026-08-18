@@ -801,15 +801,35 @@
 
   // Stop = start/stop listening. Kick off system-audio capture straight from the click so
   // the user-gesture is fresh for getDisplayMedia (loopback capture needs it).
+  // Listen button: the icon flips the instant you click (optimistic), the
+  // button locks while the toggle is in flight (no double-click desync), and
+  // the confirmed capture:state from main settles the final look. Previously
+  // the icon only changed after the full round-trip (model start/resume), so
+  // it lagged and looked like the click was ignored.
+  let listenToggling = false;
   $('#stop-btn').addEventListener('click', async () => {
-    const turningOn = !$('#stop-btn').classList.contains('active');
-    if (turningOn) {
-      // startSystemAudio may fail (user cancels, no permission) — that's OK,
-      // mic will still work and capture will toggle regardless
-      try { await startSystemAudio(); } catch (_) { /* handled inside startSystemAudio */ }
+    const btn = $('#stop-btn');
+    if (listenToggling) return;
+    listenToggling = true;
+    const turningOn = !btn.classList.contains('active');
+    btn.classList.toggle('active', turningOn);
+    btn.classList.add('pending');
+    setListenIcon(turningOn); // instant visual feedback
+    try {
+      if (turningOn) {
+        // startSystemAudio may fail (user cancels, no permission) — that's OK,
+        // mic will still work and capture will toggle regardless
+        try { await startSystemAudio(); } catch (_) { /* handled inside startSystemAudio */ }
+      }
+      const active = await cue.captureToggle();
+      if (turningOn && !active) stopSystemAudio();
+      // settle to the truth (capture:state also does this; keep them in sync)
+      btn.classList.toggle('active', !!active);
+      setListenIcon(!!active);
+    } finally {
+      btn.classList.remove('pending');
+      listenToggling = false;
     }
-    const active = await cue.captureToggle();
-    if (turningOn && !active) stopSystemAudio();
   });
 
   // Transcript toggle removed — sidebar now auto-opens with listening
