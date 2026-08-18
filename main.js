@@ -48,6 +48,7 @@ const { WhisperModelManager } = require('./src/whisper-model-manager');
 const { requireWhisperModel } = require('./src/whisper-model-catalog');
 const { locateWhisperRuntime } = require('./src/whisper-runtime');
 const { LocalWhisperTranscriber } = require('./src/local-whisper-transcriber');
+const { UtteranceSegmenter } = require('./src/utterance-segmenter');
 const { reapOrphanedServers } = require('./src/whisper-server-session');
 
 let win = null;
@@ -100,6 +101,9 @@ function residentKey(model, runtime, localSettings) {
   return [model.id, runtime.executablePath, localSettings.language || 'auto', Number(localSettings.threads) || 0].join('|');
 }
 async function releaseResidentWhisper() {
+  // If a preload is mid-flight, let it finish first (it re-checks the provider
+  // and discards itself), otherwise it could land after we released.
+  if (typeof preloadPromise !== 'undefined' && preloadPromise) { try { await preloadPromise; } catch (_) {} }
   const r = residentWhisper; residentWhisper = null;
   if (r) { try { await r.transcriber.forceStop(); } catch (_) {} }
 }
@@ -256,6 +260,13 @@ function preloadLocalWhisper() {
         onError: (error) => { console.log('[local-whisper] error', error && error.message); }
       });
       await transcriber.start();
+      // The user may have switched away from Local while the model was
+      // loading; if so, don't install it - tear it down so the GPU is freed.
+      if ((store.getSettings().sttProvider || 'auto') !== 'local') {
+        await transcriber.forceStop().catch(() => {});
+        console.log('[cue] local whisper preload discarded (provider changed during load)');
+        return;
+      }
       await transcriber.stop({ keepSession: true }); // idle: server up, not accepting audio
       residentWhisper = { key, transcriber };
       transcriber.warmup().catch(() => {});
@@ -465,6 +476,66 @@ function handleSttError(err, settings) {
   }
 }
 
+// Cloud STT (custom / OpenAI / Groq / Gemini / Azure): instead of flushing
+// whatever accumulated every 900ms (which chops words mid-utterance and sends
+// tiny fragments), audio is VAD-segmented into utterances - sent the moment
+// the speaker pauses, or every ~5s during continuous speech - exactly like the
+// local path. Each channel posts independently (concurrent), so "you" never
+// waits behind "them". Result: near-realtime, whole phrases, fewer requests.
+let cloudSegmenters = null;
+let cloudInflight = { you: 0, them: 0 };
+const CLOUD_MAX_INFLIGHT = 3; // per channel; beyond this we still queue, never drop
+function startCloudSegmenters() {
+  cloudSegmenters = {};
+  for (const channel of ['you', 'them']) {
+    const remote = channel === 'them';
+    cloudSegmenters[channel] = new UtteranceSegmenter({
+      channel,
+      // Cloud whisper is fast (~1.5s/req) and handles phrase fragments well, so
+      // stream aggressively: hard-cap at 4s of continuous speech, end an
+      // utterance after a shorter pause, and keep a longer pre-roll so the
+      // first word after silence ("And so...") is never clipped.
+      maxUtteranceMs: 4000,
+      preRollMs: 500,
+      vadOptions: { onsetThreshold: remote ? 200 : 220, offsetThreshold: remote ? 120 : 130, silenceFrames: remote ? 12 : 12 },
+      onSpeechState: (ch, speaking, durationMs) => send('vad:state', { channel: ch, speaking, durationMs }),
+      onUtterance: (ch, pcm) => sendCloudUtterance(ch, pcm)
+    });
+  }
+}
+function stopCloudSegmenters() {
+  if (!cloudSegmenters) return;
+  for (const seg of Object.values(cloudSegmenters)) { try { seg.stop(); } catch (_) {} }
+  cloudSegmenters = null;
+}
+async function sendCloudUtterance(channel, pcm) {
+  if (!state.capturing) return;
+  if (rms16(pcm) < RMS_GATE) return; // silence gate
+  cloudInflight[channel]++;
+  state.transcribing[channel] = true;
+  const t0 = Date.now();
+  const durMs = Math.round(pcm.length / 32); // 16kHz s16 mono
+  try {
+    const settings = store.getSettings();
+    const stt = createSTT(settings);
+    if (!stt.available) {
+      if (!sttDisabled) { sttDisabled = true; send('status', { message: 'No transcription provider configured. Pick one in Settings → Audio (Local, Custom, Deepgram, OpenAI, Gemini, or Azure).' }); }
+      return;
+    }
+    const res = await stt.transcribe(pcm);
+    if (res.error) { handleSttError(res.error, settings); return; }
+    const text = (res.text || '').trim();
+    console.log(`[stt] ${channel} ${durMs}ms audio -> ${Date.now() - t0}ms latency${text ? '' : ' (empty)'}`);
+    if (text && text.length > 1 && !/^[?!.,;:\-…]+$/.test(text)) publishTranscript(channel, text);
+  } catch (e) {
+    console.log('[stt] error', e && e.message);
+    recordEvent({ level: 'error', event: 'stt_failed', msg: e && e.message ? e.message : String(e), frame: 'sendCloudUtterance', context: { channel } });
+  } finally {
+    cloudInflight[channel]--;
+    if (cloudInflight[channel] <= 0) { cloudInflight[channel] = 0; state.transcribing[channel] = false; }
+  }
+}
+
 function startFlushLoop() {
   if (flushTimer) return;
   flushTimer = setInterval(() => { flushChannel('you'); flushChannel('them'); }, FLUSH_MS);
@@ -546,8 +617,11 @@ function routeAudio(channel, pcmBuffer) {
   if (streamingMode && streamingSTT[channel]) {
     // Streaming mode: send raw PCM directly to the WebSocket
     streamingSTT[channel].sendAudio(pcmBuffer);
+  } else if (cloudSegmenters && cloudSegmenters[channel]) {
+    // Cloud utterance mode: VAD-segmented, sent per phrase (near-realtime)
+    cloudSegmenters[channel].push(buf);
   } else {
-    // Batch mode: accumulate in buffers for periodic flush
+    // Legacy batch fallback
     buffers[channel].push(buf);
   }
 }
@@ -598,13 +672,15 @@ async function setCapturing(active) {
       }
     }
 
+    // A cloud/custom provider is selected: make sure no local model is loaded
+    // or holding the GPU - release the resident session (and stop any preload).
+    await releaseResidentWhisper();
     state.capturing = true;
     startLinuxThem();
-    // Try streaming first, fall back to batch
+    // Try streaming first (Deepgram/OpenAI realtime WebSockets), else
+    // utterance-segmented cloud requests (custom / whisper endpoints).
     const streaming = initStreamingSTT();
-    if (!streaming) {
-      startFlushLoop();
-    }
+    if (!streaming) startCloudSegmenters();
     console.log('[cue] capture started, mode:', streaming ? 'streaming' : 'batch');
     send('capture:state', { active: true, streaming: streamingMode, mode: streaming ? 'streaming' : 'batch' });
     return true;
@@ -612,6 +688,7 @@ async function setCapturing(active) {
 
   state.capturing = false;
   stopFlushLoop();
+  stopCloudSegmenters();
   stopStreamingSTT();
   buffers.you = []; buffers.them = [];
   vad.you.reset(); vad.them.reset();
@@ -738,7 +815,14 @@ ipcMain.handle('settings:set', (_e, patch) => {
   const next = store.setSettings(patch);
   // A change to the STT provider or local model: (re)preload so the mic is
   // instant next time. Cheap when nothing relevant changed (keyed check).
-  if (patch && (patch.sttProvider !== undefined || patch.localWhisper !== undefined)) setTimeout(preloadLocalWhisper, 200);
+  if (patch && (patch.sttProvider !== undefined || patch.localWhisper !== undefined)) {
+    if ((next.sttProvider || 'auto') !== 'local') {
+      // Not local any more: drop the resident model + free the GPU right away.
+      releaseResidentWhisper().catch(() => {});
+    } else {
+      setTimeout(preloadLocalWhisper, 200);
+    }
+  }
   return next;
 });
 ipcMain.handle('capture:toggle', () => {

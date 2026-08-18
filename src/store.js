@@ -32,6 +32,9 @@ const DEFAULTS = {
   // Azure STT: the deployment name of an *audio* model (whisper / gpt-4o-transcribe)
   // in the same Azure resource. Empty = Azure isn't used for transcription.
   azureSttDeployment: '',
+  // Custom speech-to-text: any OpenAI-compatible /audio/transcriptions endpoint
+  // (self-hosted whisper, OVH, Groq-style gateways...). URL + model + key.
+  customStt: { url: '', model: '', apiKey: '' },
   // Tab 2: Profile
   resumeText: '',
   jobDescription: '',

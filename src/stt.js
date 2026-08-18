@@ -74,6 +74,46 @@ async function transcribeAzure(apiKey, wav, deployment, endpoint, prompt) {
   return (res.text || '').trim();
 }
 
+// Custom OpenAI-compatible transcription endpoint (POST multipart to
+// .../audio/transcriptions). Raw fetch, no SDK: one small request per
+// utterance with a keep-alive connection, so it's as fast as the endpoint
+// allows. Accepts either the full .../audio/transcriptions URL or a base URL.
+function customSttEndpoint(url) {
+  const u = String(url || '').trim().replace(/\/+$/, '');
+  if (!u) return '';
+  return /\/audio\/transcriptions$/i.test(u) ? u : u.replace(/\/v1$/i, '') + '/v1/audio/transcriptions';
+}
+async function transcribeCustom(cfg, wav, prompt) {
+  const endpoint = customSttEndpoint(cfg.url);
+  if (!endpoint) throw new Error('Set the Custom transcription URL in Settings → Audio.');
+  const form = new FormData();
+  form.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
+  form.append('model', cfg.model || 'whisper-1');
+  form.append('response_format', 'json');
+  form.append('temperature', '0');
+  form.append('language', 'en');
+  if (prompt) form.append('prompt', prompt);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {},
+      body: form,
+      signal: controller.signal,
+      keepalive: true
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      const err = new Error(`Custom STT ${res.status}: ${body.slice(0, 200) || res.statusText}`);
+      err.status = res.status;
+      throw err;
+    }
+    const data = await res.json();
+    return String(data.text || '').trim();
+  } finally { clearTimeout(timer); }
+}
+
 async function transcribeGemini(apiKey, wav) {
   const { GoogleGenAI } = require('@google/genai');
   const ai = new GoogleGenAI({ apiKey });
@@ -92,6 +132,10 @@ function createSTT(settings) {
   const selectedProvider = settings.sttProvider || 'auto';
   const vocabPrompt = buildVocabPrompt(settings);
   const chain = [];
+  const custom = settings.customStt || {};
+  if ((selectedProvider === 'auto' || selectedProvider === 'custom') && custom.url) {
+    chain.push({ p: 'custom', fn: (wav) => transcribeCustom(custom, wav, vocabPrompt) });
+  }
   if ((selectedProvider === 'auto' || selectedProvider === 'openai') && keys.openai) {
     chain.push({ p: 'openai', fn: (wav) => transcribeOpenAI(keys.openai, wav, settings.sttModel, undefined, vocabPrompt) });
   }
@@ -104,7 +148,9 @@ function createSTT(settings) {
   if ((selectedProvider === 'auto' || selectedProvider === 'azure') && keys.azure && settings.azureEndpoint && settings.azureSttDeployment) {
     chain.push({ p: 'azure', fn: (wav) => transcribeAzure(keys.azure, wav, settings.azureSttDeployment, settings.azureEndpoint, vocabPrompt) });
   }
-  if (keys.openai && chain.length > 1) chain.unshift(chain.splice(chain.findIndex((c) => c.p === 'openai'), 1)[0]);
+  // In auto mode prefer OpenAI when present; an explicit selection is already
+  // the only entry, so this never overrides what the user picked.
+  if (selectedProvider === 'auto' && keys.openai && chain.length > 1) chain.unshift(chain.splice(chain.findIndex((c) => c.p === 'openai'), 1)[0]);
 
   let disabledUntil = 0;
   let lastProvider = null;
@@ -144,4 +190,4 @@ function createSTT(settings) {
   };
 }
 
-module.exports = { createSTT, looksLikeHallucination, buildVocabPrompt };
+module.exports = { createSTT, looksLikeHallucination, buildVocabPrompt, customSttEndpoint };

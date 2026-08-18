@@ -192,6 +192,7 @@
           <option value="openai">OpenAI</option>
           <option value="gemini">Gemini</option>
           <option value="azure">Azure</option>
+          <option value="custom">Custom — any OpenAI-compatible endpoint</option>
         </select>
         <div class="s-note">Local keeps your microphone and meeting audio on this computer and never falls back to a cloud provider.</div>
 
@@ -200,6 +201,9 @@
         <div class="s-field stt-field" data-stt-key="openai"><span>OpenAI</span><input id="stt-key-openai" type="password" placeholder="sk-… (same key as the OpenAI provider)" autocomplete="off" /></div>
         <div class="s-field stt-field" data-stt-key="gemini"><span>Gemini</span><input id="stt-key-gemini" type="password" placeholder="AIza… (same key as the Gemini provider)" autocomplete="off" /></div>
         <div class="s-field stt-field" data-stt-key="azure"><span>Azure deployment</span><input id="azure-stt-deployment" type="text" placeholder="e.g. whisper (an audio model deployment)" autocomplete="off" /></div>
+        <div class="s-field stt-field" data-stt-key="custom"><span>Endpoint URL</span><input id="custom-stt-url" type="url" placeholder="https://host/v1/audio/transcriptions (or the /v1 base)" autocomplete="off" spellcheck="false" /></div>
+        <div class="s-field stt-field" data-stt-key="custom"><span>Model</span><input id="custom-stt-model" type="text" placeholder="e.g. whisper-large-v3-turbo" autocomplete="off" /></div>
+        <div class="s-field stt-field" data-stt-key="custom"><span>API key</span><input id="custom-stt-key" type="password" placeholder="Bearer token (optional if the endpoint is open)" autocomplete="off" /></div>
         <div class="s-note" id="stt-keys-note">OpenAI and Gemini reuse your keys from the Keys tab. <strong>Azure</strong> reuses your Azure key + endpoint from the Keys tab — give an <em>audio</em> deployment (whisper / gpt-4o-transcribe), not your chat deployment.</div>
 
         <div id="linux-audio-field" class="hidden">

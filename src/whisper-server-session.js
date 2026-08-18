@@ -51,9 +51,24 @@ function reapOrphanedServers() {
     let cmd = '';
     try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch (_) { continue; } // gone
     if (/whisper-server|cue-whisper-watch/.test(cmd)) {
-      try { process.kill(pid, 'SIGTERM'); reaped++; } catch (_) { /* already gone */ }
+      // Kill the group first (shell + server together), then the pid itself.
+      try { process.kill(-pid, 'SIGTERM'); } catch (_) { /* no group */ }
+      try { process.kill(pid, 'SIGTERM'); } catch (_) { /* already gone */ }
+      reaped++;
     } else { alive.push(pid); }
   }
+  // Belt and braces: any whisper-server that lost its watchdog (reparented to
+  // init) won't be in the PID file under its own pid - sweep /proc for ours.
+  try {
+    for (const d of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(d)) continue;
+      let cmd = '';
+      try { cmd = fs.readFileSync(`/proc/${d}/cmdline`, 'utf8'); } catch (_) { continue; }
+      if (cmd.includes('whisper-server') && cmd.includes('--request-path') && cmd.includes('/cue-')) {
+        try { process.kill(parseInt(d, 10), 'SIGTERM'); reaped++; } catch (_) {}
+      }
+    }
+  } catch (_) { /* non-Linux or no /proc */ }
   writePids([]);
   return reaped;
 }
@@ -170,7 +185,11 @@ class WhisperServerSession {
       cwd: this.runtimeDirectory,
       env: this._buildRuntimeEnvironment(),
       stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true,
+      // Own process group (POSIX): the watchdog shell AND whisper-server share
+      // it, so stop() can signal the whole group. Killing only the shell would
+      // orphan the server (reparented to init) with the model still on the GPU.
+      detached: usePdeathWatch
     });
     this._observeChild(this.child);
     registerServerPid(this.child.pid);
@@ -221,6 +240,15 @@ class WhisperServerSession {
     for (const controller of this.inferenceControllers) controller.abort();
   }
 
+  // Signal the child's whole process group on POSIX (shell + server), so the
+  // server can never survive as an orphan holding GPU memory.
+  _signal(child, sig) {
+    if (process.platform !== 'win32' && child.pid) {
+      try { process.kill(-child.pid, sig); return; } catch (_) { /* group gone; fall through */ }
+    }
+    try { child.kill(sig); } catch (_) { /* already gone */ }
+  }
+
   async stop({ force = false } = {}) {
     this.stopRequested = true;
     const child = this.child;
@@ -232,7 +260,7 @@ class WhisperServerSession {
     this.abortInferences();
     if (child.exitCode !== null || child.signalCode !== null) return;
     const exited = new Promise((resolve) => child.once('exit', resolve));
-    child.kill(force ? 'SIGKILL' : 'SIGTERM');
+    this._signal(child, force ? 'SIGKILL' : 'SIGTERM');
     if (force) return;
 
     let exitTimeout = null;
@@ -243,7 +271,7 @@ class WhisperServerSession {
       })
     ]);
     if (exitTimeout) clearTimeout(exitTimeout);
-    if (!closedGracefully && child.exitCode === null) child.kill('SIGKILL');
+    if (!closedGracefully && child.exitCode === null) this._signal(child, 'SIGKILL');
   }
 
   _buildArguments(port, requestPath) {
