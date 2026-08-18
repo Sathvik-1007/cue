@@ -4,7 +4,7 @@
 # src/whisper-runtime.js). Vulkan works on NVIDIA, AMD and Intel GPUs alike and
 # needs no CUDA toolkit — just the Vulkan headers + glslc.
 #
-#   Arch:   sudo pacman -S --needed vulkan-headers shaderc cmake
+#   Arch:   sudo pacman -S --needed vulkan-headers spirv-headers shaderc cmake
 #   Debian: sudo apt install libvulkan-dev glslc cmake
 set -euo pipefail
 TAG="${WHISPER_TAG:-v1.9.1}"   # matches the version cue bundles

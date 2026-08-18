@@ -207,7 +207,20 @@ class WhisperServerSession {
     } else {
       environment.LD_LIBRARY_PATH = `${this.runtimeDirectory}${path.delimiter}${environment.LD_LIBRARY_PATH || ''}`;
     }
+    // GPU runtime: steer ggml to the discrete GPU on dual-GPU laptops (it
+    // defaults to device 0, usually the slow iGPU). Respect an explicit user
+    // override; only probe when the runtime actually ships the Vulkan backend.
+    if (!environment.GGML_VK_VISIBLE_DEVICES && this._runtimeHasVulkan()) {
+      Object.assign(environment, require('./gpu-select').vulkanEnvForBestDevice());
+    }
     return environment;
+  }
+
+  _runtimeHasVulkan() {
+    try {
+      const fs = require('fs');
+      return fs.readdirSync(this.runtimeDirectory).some((f) => /libggml-vulkan/.test(f));
+    } catch (_) { return false; }
   }
 
   _observeChild(child) {

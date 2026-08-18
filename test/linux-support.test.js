@@ -93,3 +93,20 @@ test('pickNonBluetoothMic avoids flipping a Bluetooth headset to HFP', () => {
   assert.equal(pickNonBluetoothMic([bt, mon], bt.name), null);
   assert.equal(pickNonBluetoothMic([], ''), null);
 });
+
+test('gpu-select prefers a discrete GPU over the integrated one', () => {
+  const g = require('../src/gpu-select');
+  // ggml's own enumeration format (this machine): iGPU is device 0
+  const ggml = 'ggml_vulkan: Found 2 Vulkan devices:\nggml_vulkan: 0 = Intel(R) UHD Graphics (CML GT2) (Intel open-source Mesa driver) | uma: 1 | fp16: 1\nggml_vulkan: 1 = NVIDIA GeForce GTX 1650 Ti (NVIDIA) | uma: 0 | fp16: 1\n';
+  const names = g.parseVulkanDevices(ggml);
+  assert.deepEqual(names, ['Intel(R) UHD Graphics (CML GT2) (Intel open-source Mesa driver)', 'NVIDIA GeForce GTX 1650 Ti (NVIDIA)']);
+  assert.equal(g.pickDeviceIndex(names), 1, 'picks the NVIDIA, not device 0');
+  // vulkaninfo --summary format
+  const vi = 'deviceName         = Intel(R) UHD Graphics (CML GT2)\n...\ndeviceName         = NVIDIA GeForce GTX 1650 Ti\n';
+  assert.equal(g.pickDeviceIndex(g.parseVulkanDevices(vi)), 1);
+  // single device -> leave default; AMD discrete beats AMD integrated
+  assert.equal(g.pickDeviceIndex(['NVIDIA GeForce RTX 4070']), null);
+  assert.equal(g.pickDeviceIndex(['AMD Radeon Graphics', 'AMD Radeon RX 7800 XT']), 1);
+  // only integrated + software -> null (don't force anything)
+  assert.equal(g.pickDeviceIndex(['Intel(R) Iris Xe', 'llvmpipe']), null);
+});
