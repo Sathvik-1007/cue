@@ -153,6 +153,13 @@ async function startLocalWhisper(settings) {
   const model = requireWhisperModel(localSettings.modelId || 'base.en');
   const runtime = getWhisperRuntime();
   if (!runtime.available) throw new Error(runtime.message);
+  // A large model on the CPU runtime is ~5x slower than real time (measured:
+  // large-v3-turbo = 54s per 11s of audio) - it silently falls hopelessly
+  // behind and looks broken. Say so up front instead of letting it happen.
+  const isLarge = /^(large|medium)/.test(model.id);
+  if (isLarge && (runtime.backend || 'cpu') === 'cpu') {
+    send('status', { message: `${model.id} is running on CPU, which is far too slow for live transcription (it falls minutes behind). Build the GPU runtime (Settings -> Audio hint) or pick base.en / small.en for CPU.` });
+  }
   activeWhisperModelId = model.id;
   let transcriber = null;
   try {

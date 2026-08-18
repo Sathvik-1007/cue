@@ -4,10 +4,12 @@ const DEFAULT_SAMPLE_RATE = 16000;
 const PCM_BYTES_PER_SAMPLE = 2;
 const DEFAULT_PRE_ROLL_MS = 300;
 const DEFAULT_MIN_UTTERANCE_MS = 180;
-// Cap each utterance at 12s so long stretches of speech transcribe and appear
-// in parts as they happen instead of one big block much later; overlapMs keeps
-// a word that straddles the cut from being lost.
-const DEFAULT_MAX_UTTERANCE_MS = 12000;
+// Cap each utterance at 5s: during continuous speech a chunk is transcribed
+// every ~5s, so text streams in near-realtime instead of waiting for a pause
+// (a lecture or a non-stop talker used to produce nothing for 12s+). Short
+// pauses still finalize sooner via silence detection. overlapMs re-feeds the
+// last 300ms into the next chunk so a word straddling the cut isn't lost.
+const DEFAULT_MAX_UTTERANCE_MS = 5000;
 const DEFAULT_OVERLAP_MS = 300;
 
 class UtteranceSegmenter {
