@@ -495,10 +495,16 @@ function startCloudSegmenters() {
       // stream aggressively: hard-cap at 4s of continuous speech, end an
       // utterance after a shorter pause, and keep a longer pre-roll so the
       // first word after silence ("And so...") is never clipped.
-      maxUtteranceMs: 4000,
+      maxUtteranceMs: 3000,
       preRollMs: 500,
       vadOptions: { onsetThreshold: remote ? 200 : 220, offsetThreshold: remote ? 120 : 130, silenceFrames: remote ? 12 : 12 },
-      onSpeechState: (ch, speaking, durationMs) => send('vad:state', { channel: ch, speaking, durationMs }),
+      onSpeechState: (ch, speaking, durationMs) => {
+        if (ch === 'them') { cloudBleed.them = speaking; if (!speaking) cloudBleed.themLastEnd = Date.now(); }
+        send('vad:state', { channel: ch, speaking, durationMs });
+        // Live feedback: the instant speech is detected show a "hearing you"
+        // interim, so there is never a silent gap between speaking and text.
+        if (speaking) send('stt:interim', { channel: ch, text: '…', phase: 'hearing' });
+      },
       onUtterance: (ch, pcm) => sendCloudUtterance(ch, pcm)
     });
   }
@@ -508,13 +514,24 @@ function stopCloudSegmenters() {
   for (const seg of Object.values(cloudSegmenters)) { try { seg.stop(); } catch (_) {} }
   cloudSegmenters = null;
 }
+// Speaker-bleed guard for the cloud path (same rule as the local transcriber):
+// a "you" utterance captured while "them" is talking and much quieter than the
+// speaker output is the mic hearing the speakers, not the user. Drop it.
+const cloudBleed = { them: false, themLastEnd: 0, themRms: 0 };
+function isCloudSpeakerBleed(channel, pcm) {
+  if (channel !== 'you') return false;
+  const themActive = cloudBleed.them || (Date.now() - cloudBleed.themLastEnd) < 800;
+  return themActive && cloudBleed.themRms > 0 && rms16(pcm) < cloudBleed.themRms * 0.55;
+}
 async function sendCloudUtterance(channel, pcm) {
   if (!state.capturing) return;
   if (rms16(pcm) < RMS_GATE) return; // silence gate
+  if (isCloudSpeakerBleed(channel, pcm)) { send('stt:final', { channel, text: '' }); return; }
   cloudInflight[channel]++;
   state.transcribing[channel] = true;
   const t0 = Date.now();
   const durMs = Math.round(pcm.length / 32); // 16kHz s16 mono
+  send('stt:interim', { channel, text: '…', phase: 'transcribing' });
   try {
     const settings = store.getSettings();
     const stt = createSTT(settings);
@@ -523,11 +540,13 @@ async function sendCloudUtterance(channel, pcm) {
       return;
     }
     const res = await stt.transcribe(pcm);
-    if (res.error) { handleSttError(res.error, settings); return; }
+    if (res.error) { send('stt:final', { channel, text: '' }); handleSttError(res.error, settings); return; }
     const text = (res.text || '').trim();
     console.log(`[stt] ${channel} ${durMs}ms audio -> ${Date.now() - t0}ms latency${text ? '' : ' (empty)'}`);
     if (text && text.length > 1 && !/^[?!.,;:\-…]+$/.test(text)) publishTranscript(channel, text);
+    else send('stt:final', { channel, text: '' }); // nothing said: clear "transcribing…"
   } catch (e) {
+    send('stt:final', { channel, text: '' });
     console.log('[stt] error', e && e.message);
     recordEvent({ level: 'error', event: 'stt_failed', msg: e && e.message ? e.message : String(e), frame: 'sendCloudUtterance', context: { channel } });
   } finally {
@@ -619,6 +638,7 @@ function routeAudio(channel, pcmBuffer) {
     streamingSTT[channel].sendAudio(pcmBuffer);
   } else if (cloudSegmenters && cloudSegmenters[channel]) {
     // Cloud utterance mode: VAD-segmented, sent per phrase (near-realtime)
+    if (channel === 'them') { const r = rms16(buf); cloudBleed.themRms = cloudBleed.themRms ? cloudBleed.themRms * 0.7 + r * 0.3 : r; }
     cloudSegmenters[channel].push(buf);
   } else {
     // Legacy batch fallback

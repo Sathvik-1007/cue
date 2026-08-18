@@ -1140,6 +1140,27 @@
     closeSidebarBtn.addEventListener('click', hideSidebar);
   }
 
+  // Type a chunk into a text node word by word (~35ms/word) so a transcript
+  // chunk visibly flows in like live speech instead of landing as one block.
+  // Chunks queue per element so successive chunks never interleave.
+  const typeQueues = new WeakMap();
+  function typeWords(el, chunk, sep) {
+    const words = String(chunk).trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return;
+    const prev = typeQueues.get(el) || Promise.resolve();
+    const run = prev.then(() => new Promise((resolve) => {
+      let i = 0;
+      const tick = () => {
+        if (!el.isConnected) return resolve();
+        el.textContent += (el.textContent && i === 0 ? sep : (i === 0 ? '' : ' ')) + words[i];
+        i++;
+        if (i < words.length) setTimeout(tick, 35); else resolve();
+      };
+      tick();
+    }));
+    typeQueues.set(el, run);
+  }
+
   function appendTranscriptHistoryTurn(channel, text, isInterim) {
     const list = document.getElementById('ts-list');
     if (!list) return;
@@ -1171,11 +1192,9 @@
       const useExisting = existingRow && existingRow.isConnected;
 
       if (useExisting) {
-        // Append to existing row — accumulates sentence fragments
+        // Append to existing row — accumulates sentence fragments, typed in
         const txt = existingRow.querySelector('.ts-text');
-        if (txt) {
-          txt.textContent = txt.textContent ? txt.textContent + ' ' + text : text;
-        }
+        if (txt) typeWords(txt, text, ' ');
       } else {
         // Start a new row (no buttons — just clean history view)
         const row = document.createElement('div');
@@ -1187,12 +1206,12 @@
 
         const txt = document.createElement('span');
         txt.className = 'ts-text';
-        txt.textContent = text;
 
         row.appendChild(chLabel);
         row.appendChild(txt);
         list.appendChild(row);
         tsLastRow[channel] = row;
+        typeWords(txt, text, '');
       }
 
       // Reset silence timer
@@ -1291,12 +1310,29 @@
     }
   }
   
-  cue.on('stt:interim', ({ channel, text }) => {
+  // Live-status phases from the utterance path (no partial words available
+  // from batch endpoints, so we show WHAT is happening instead of nothing):
+  //   hearing      -> speech detected, still listening
+  //   transcribing -> chunk sent, waiting for the words
+  function showPhase(channel, phase) {
+    const label = channel === 'them' ? 'Them' : 'You';
+    setLiveDotState(phase === 'hearing' ? 'speaking' : 'transcribing');
+    const el = getOrCreateInterimEl();
+    el.textContent = phase === 'hearing' ? `${label}: hearing you…` : `${label}: transcribing…`;
+    el.classList.add('show');
+    el.classList.toggle('hearing', phase === 'hearing');
+    appendTranscriptHistoryTurn(channel, phase === 'hearing' ? '● hearing…' : '● transcribing…', true);
+  }
+  function showHearing(channel) { showPhase(channel, 'hearing'); }
+  cue.on('stt:interim', ({ channel, text, phase }) => {
+    const label = channel === 'them' ? 'Them' : 'You';
+    if (phase === 'hearing' || phase === 'transcribing') { showPhase(channel, phase); return; }
+    // Real partial words (WebSocket streaming providers)
     setLiveDotState('transcribing');
     const el = getOrCreateInterimEl();
-    const label = channel === 'them' ? 'Them' : 'You';
     el.textContent = `${label}: ${text}`;
     el.classList.add('show');
+    el.classList.remove('hearing');
     appendTranscriptHistoryTurn(channel, text, true); // update sidebar interim
     
     // FIX #12: Show interviewer's interim speech in input area
@@ -1307,10 +1343,13 @@
   cue.on('stt:final', ({ channel, text }) => {
     setLiveDotState('idle');
     // Clear interim when we get a final
-    if (interimEl) { interimEl.textContent = ''; interimEl.classList.remove('show'); }
+    if (interimEl) { interimEl.textContent = ''; interimEl.classList.remove('show', 'hearing'); }
     clearTranscriptInterim();
     clearInputInterim(); // FIX #12: Clear interim text from input area
     // sidebar: the final turn is added via the 'transcript' event below
+    // Still mid-sentence (chunk was capped, speech continues): keep showing
+    // "hearing you…" so the bar never goes blank while someone is talking.
+    if (vadSpeaking[channel]) showHearing(channel);
   });
   cue.on('stt:status', ({ channel, status, provider }) => {
     cue.log(`[stt] ${provider || channel || 'unknown'} ${status}`);
@@ -1342,8 +1381,13 @@
       if (label) { label.textContent = sttState; label.className = 'stt-status stt-streaming'; }
     }
   });
+  const vadSpeaking = { you: false, them: false };
   cue.on('vad:state', ({ channel, speaking }) => {
+    vadSpeaking[channel] = !!speaking;
     setLiveDotState(speaking ? 'speaking' : 'idle');
+    // Speech ended: drop the "hearing you…" bar (a chunk in flight will show
+    // "transcribing…" on its own).
+    if (!speaking && interimEl && interimEl.classList.contains('hearing')) { interimEl.textContent = ''; interimEl.classList.remove('show', 'hearing'); clearTranscriptInterim(); }
   });
   cue.on('llm:start', ({ userBubble, small, category }) => {
     responseCount++;
